@@ -1,5 +1,5 @@
 use std::iter::FromIterator;
-use std::ops::{Deref, Index, Rem};
+use std::ops::{Deref, Index, IndexMut, Rem};
 
 pub struct WrappingVec<T> {
     inner: Vec<T>,
@@ -25,13 +25,23 @@ impl<T> FromIterator<T> for WrappingVec<T> {
     }
 }
 
-impl<T, I: Rem<usize, Output = O>, O> Index<I> for WrappingVec<T>
+impl<T, I: Rem<usize>> Index<I> for WrappingVec<T>
 where
-    Vec<T>: Index<O>,
+    Vec<T>: Index<<I as Rem<usize>>::Output>,
 {
-    type Output = <Vec<T> as Index<O>>::Output;
+    type Output = <Vec<T> as Index<<I as Rem<usize>>::Output>>::Output;
 
     fn index(&self, index: I) -> &<Self as Index<I>>::Output {
         &self.inner[index % self.inner.len()]
+    }
+}
+
+impl<T, I: Rem<usize>> IndexMut<I> for WrappingVec<T>
+    where
+        Vec<T>: IndexMut<<I as Rem<usize>>::Output>,
+{
+    fn index_mut(&mut self, index: I) -> &mut <Self as Index<I>>::Output {
+        let len = self.inner.len();
+        &mut self.inner[index % len]
     }
 }
