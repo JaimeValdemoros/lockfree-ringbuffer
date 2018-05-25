@@ -1,18 +1,59 @@
 extern crate rand;
 
-mod wrapping_vec;
-
-use wrapping_vec::WrappingVec;
-
 use std::cell::UnsafeCell;
 use std::iter::repeat;
+use std::ops::{Add, AddAssign};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 pub struct RingBuffer<T> {
     pub(crate) size: usize,
     pub(crate) head: AtomicUsize,
     pub(crate) tail: AtomicIsize,
-    pub(crate) data: WrappingVec<UnsafeCell<Option<T>>>,
+    pub(crate) data: Vec<UnsafeCell<Option<T>>>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Tail {
+    pub locked: bool,
+    pub value: usize,
+}
+
+impl Add<usize> for Tail {
+    type Output = Self;
+
+    fn add(mut self, rhs: usize) -> <Self as Add<usize>>::Output {
+        self.value += rhs;
+        self
+    }
+}
+
+impl AddAssign<usize> for Tail {
+    fn add_assign(&mut self, rhs: usize) {
+        self.value += rhs;
+    }
+}
+
+impl From<isize> for Tail {
+    fn from(v: isize) -> Self {
+        Tail {
+            locked: v.is_negative(),
+            value: if !v.is_negative() {
+                v as usize
+            } else {
+                v.abs() as usize - 1
+            },
+        }
+    }
+}
+
+impl Into<isize> for Tail {
+    fn into(self) -> isize {
+        if !self.locked {
+            self.value as isize
+        } else {
+            -(self.value as isize) - 1
+        }
+    }
 }
 
 impl<T: Send> RingBuffer<T> {
@@ -31,39 +72,49 @@ impl<T: Send> RingBuffer<T> {
         let head_ptr: *mut Option<T> = self.data[head].get();
         let head_ptr: &mut Option<T> = unsafe { &mut *head_ptr };
         *head_ptr = Some(x);
-        self.head.store(head + 1, Ordering::SeqCst);
 
         loop {
-            let tail = self.tail.load(Ordering::SeqCst);
+            let tail: Tail = self.tail.load(Ordering::SeqCst).into();
 
-            if head - (tail.abs() as usize) < self.size {
+            if head - tail.value < self.size {
                 break;
             }
 
-            if tail.is_negative() {
+            if tail.locked {
                 continue;
             }
 
-            if self.tail.compare_and_swap(tail, tail + 1, Ordering::SeqCst) == tail {
-                let tail_ptr: *mut Option<T> = self.data[tail as usize].get();
+            if self.tail
+                .compare_and_swap(tail.into(), (tail + 1).into(), Ordering::SeqCst)
+                == tail.into()
+            {
+                let tail_ptr: *mut Option<T> = self.data[tail.value].get();
                 let tail_ptr: &mut Option<T> = unsafe { &mut *tail_ptr };
-                tail_ptr.take();
+                *tail_ptr = None;
                 break;
             }
         }
+
+        self.head.store(head + 1, Ordering::SeqCst);
     }
 
     pub fn read(&self) -> RingIter<T> {
         let tail = loop {
-            let tail = self.tail.load(Ordering::SeqCst);
-            if self.tail.compare_and_swap(tail, -tail, Ordering::SeqCst) == tail {
-                break tail;
+            let tail: Tail = self.tail.load(Ordering::SeqCst).into();
+            assert!(!tail.locked);
+            let mut new_tail = tail;
+            new_tail.locked = true;
+            if self.tail
+                .compare_and_swap(tail.into(), new_tail.into(), Ordering::SeqCst)
+                == tail.into()
+            {
+                break new_tail;
             }
         };
         let head = self.head.load(Ordering::SeqCst);
         RingIter {
             fixed_head: head,
-            current_tail: tail as usize,
+            current_tail: tail,
             inner: &self,
         }
     }
@@ -71,7 +122,7 @@ impl<T: Send> RingBuffer<T> {
 
 pub struct RingIter<'a, T: 'a> {
     pub(crate) fixed_head: usize,
-    pub(crate) current_tail: usize,
+    pub(crate) current_tail: Tail,
     pub(crate) inner: &'a RingBuffer<T>,
 }
 
@@ -79,22 +130,19 @@ impl<'a, T> Iterator for RingIter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<<Self as Iterator>::Item> {
-        if self.current_tail == self.fixed_head {
+        if !self.current_tail.locked {
             None
         } else {
             let res = {
-                let tail_ptr: *mut Option<T> = self.inner.data[self.current_tail].get();
+                let tail_ptr: *mut Option<T> = self.inner.data[self.current_tail.value].get();
                 let tail_ptr: &mut Option<T> = unsafe { &mut *tail_ptr };
                 tail_ptr.take()
             };
-            let new_tail = self.current_tail + 1;
-            self.current_tail = new_tail;
-            let store_tail = if new_tail == self.fixed_head {
-                new_tail as isize
-            } else {
-                -(new_tail as isize)
-            };
-            self.inner.tail.store(store_tail, Ordering::SeqCst);
+            self.current_tail += 1;
+            if self.current_tail.value == self.fixed_head {
+                self.current_tail.locked = false;
+            }
+            self.inner.tail.store(self.current_tail.into(), Ordering::SeqCst);
             res
         }
     }
@@ -102,18 +150,33 @@ impl<'a, T> Iterator for RingIter<'a, T> {
 
 impl<'a, T: 'a> Drop for RingIter<'a, T> {
     fn drop(&mut self) {
-        if self.current_tail < self.fixed_head {
+        if self.current_tail.locked {
+            self.current_tail.locked = false;
             self.inner
                 .tail
-                .store(self.current_tail as isize, Ordering::Relaxed);
+                .store(self.current_tail.into(), Ordering::Relaxed);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn tail_conversion() {
+        for locked in &[true, false] {
+            for value in 0..100 {
+                let tail = Tail {
+                    locked: *locked,
+                    value,
+                };
+                assert_eq!(<Tail as From<isize>>::from(tail.into()), tail)
+            }
+        }
+
+        for i in -20isize..=20isize {
+            assert_eq!(<Tail as Into<isize>>::into(Tail::from(i)), i)
+        }
     }
 }
