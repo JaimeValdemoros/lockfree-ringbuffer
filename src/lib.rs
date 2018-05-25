@@ -3,7 +3,46 @@ extern crate rand;
 use std::cell::UnsafeCell;
 use std::iter::repeat;
 use std::ops::{Add, AddAssign};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+
+pub struct RingBufferReader<T> {
+    inner: Arc<RingBuffer<T>>,
+}
+
+impl<T: Send> RingBufferReader<T> {
+    pub fn read(&mut self) -> RingIter<T> {
+        self.inner.read()
+    }
+}
+
+impl<T> From<Arc<RingBuffer<T>>> for RingBufferReader<T> {
+    fn from(inner: Arc<RingBuffer<T>>) -> Self {
+        RingBufferReader { inner }
+    }
+}
+
+pub struct RingBufferWriter<T> {
+    inner: Arc<RingBuffer<T>>,
+}
+
+impl<T: Send> RingBufferWriter<T> {
+    pub fn write(&mut self, x: T) {
+        self.inner.write(x)
+    }
+}
+
+impl<T> From<Arc<RingBuffer<T>>> for RingBufferWriter<T> {
+    fn from(inner: Arc<RingBuffer<T>>) -> Self {
+        RingBufferWriter { inner }
+    }
+}
+
+pub fn new<T: Send>(size: usize) -> (RingBufferReader<T>, RingBufferWriter<T>) {
+    let buffer = Arc::new(RingBuffer::new(size));
+
+    (buffer.clone().into(), buffer.clone().into())
+}
 
 pub struct RingBuffer<T> {
     pub(crate) size: usize,
@@ -12,8 +51,10 @@ pub struct RingBuffer<T> {
     pub(crate) data: Vec<UnsafeCell<Option<T>>>,
 }
 
+unsafe impl<T: Send> Sync for RingBuffer<T> {}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Tail {
+struct Tail {
     pub locked: bool,
     pub value: usize,
 }
@@ -66,7 +107,7 @@ impl<T: Send> RingBuffer<T> {
         }
     }
 
-    pub fn push(&self, x: T) {
+    pub fn write(&self, x: T) {
         let head = self.head.load(Ordering::SeqCst);
         // Get the pointer to the next slot, which is guaranteed to be empty.
         let head_ptr: *mut Option<T> = self.data[head].get();
@@ -142,7 +183,9 @@ impl<'a, T> Iterator for RingIter<'a, T> {
             if self.current_tail.value == self.fixed_head {
                 self.current_tail.locked = false;
             }
-            self.inner.tail.store(self.current_tail.into(), Ordering::SeqCst);
+            self.inner
+                .tail
+                .store(self.current_tail.into(), Ordering::SeqCst);
             res
         }
     }
