@@ -46,7 +46,7 @@ pub fn new<T: Send>(size: usize) -> (RingBufferReader<T>, RingBufferWriter<T>) {
     (buffer.clone().into(), buffer.clone().into())
 }
 
-pub struct RingBuffer<T> {
+struct RingBuffer<T> {
     pub(crate) size: usize,
     pub(crate) head: AtomicUsize,
     pub(crate) tail: AtomicIsize,
