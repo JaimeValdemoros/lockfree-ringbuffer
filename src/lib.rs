@@ -18,6 +18,7 @@ impl<T: Send> RingBufferReader<T> {
     }
 }
 
+#[doc(hidden)]
 impl<T> From<Arc<RingBuffer<T>>> for RingBufferReader<T> {
     fn from(inner: Arc<RingBuffer<T>>) -> Self {
         RingBufferReader { inner }
@@ -34,13 +35,14 @@ impl<T: Send> RingBufferWriter<T> {
     }
 }
 
+#[doc(hidden)]
 impl<T> From<Arc<RingBuffer<T>>> for RingBufferWriter<T> {
     fn from(inner: Arc<RingBuffer<T>>) -> Self {
         RingBufferWriter { inner }
     }
 }
 
-pub fn new<T: Send>(size: usize) -> (RingBufferReader<T>, RingBufferWriter<T>) {
+pub fn new<T: Send>(size: usize) -> (RingBufferWriter<T>, RingBufferReader<T>) {
     let buffer = Arc::new(RingBuffer::new(size));
 
     (buffer.clone().into(), buffer.clone().into())
@@ -113,7 +115,7 @@ impl<T: Send> RingBuffer<T> {
     pub fn write(&self, x: T) {
         let head = self.head.load(Ordering::SeqCst);
         // Get the pointer to the next slot, which is guaranteed to be empty.
-        let head_ptr: *mut Option<T> = self.data[head].get();
+        let head_ptr: *mut Option<T> = self.data[head % self.data.len()].get();
         let head_ptr: &mut Option<T> = unsafe { &mut *head_ptr };
         *head_ptr = Some(x);
 
@@ -123,7 +125,10 @@ impl<T: Send> RingBuffer<T> {
         loop {
             let tail: Tail = self.tail.load(Ordering::SeqCst).into();
 
+            assert!(head >= tail.value, "{:?} {:?}", head, tail);
+
             if head - tail.value < self.size {
+                // invariant holds
                 break;
             }
 
@@ -136,14 +141,21 @@ impl<T: Send> RingBuffer<T> {
                 .compare_and_swap(tail.into(), (tail + 1).into(), Ordering::SeqCst)
                 == tail.into()
             {
+                // invariant holds
                 break;
             }
         }
     }
 
     pub fn read(&self) -> RingIter<T> {
-        let mut tail = loop {
+        // lineraisation point if we early-exit with empty iterator
+        let head = self.head.load(Ordering::SeqCst);
+
+        let opt_tail = loop {
             let tail: Tail = self.tail.load(Ordering::SeqCst).into();
+            if tail.value == head {
+                break None;
+            }
             assert!(!tail.locked);
             let mut new_tail = tail;
             new_tail.locked = true;
@@ -151,7 +163,21 @@ impl<T: Send> RingBuffer<T> {
                 .compare_and_swap(tail.into(), new_tail.into(), Ordering::SeqCst)
                 == tail.into()
             {
-                break new_tail;
+                break Some(new_tail);
+            }
+        };
+
+        let mut tail = match opt_tail {
+            Some(tail) => tail,
+            None => {
+                return RingIter {
+                    fixed_head: 0,
+                    current_tail: Tail {
+                        locked: false,
+                        value: 0,
+                    },
+                    inner: &self,
+                }
             }
         };
 
@@ -171,6 +197,8 @@ impl<T: Send> RingBuffer<T> {
         // In the former case, we set this to be the linearisation point. In the latter, we set the
         // linearisation point to the moment we pushed the tail.
         let head = self.head.load(Ordering::SeqCst);
+
+        assert!(head >= tail.value, "{:?} {:?}", head, tail.value);
 
         if head - tail.value == self.size + 1 {
             tail += 1;
@@ -199,7 +227,8 @@ impl<'a, T> Iterator for RingIter<'a, T> {
             None
         } else {
             let res = {
-                let tail_ptr: *mut Option<T> = self.inner.data[self.current_tail.value].get();
+                let tail_ptr: *mut Option<T> =
+                    self.inner.data[self.current_tail.value % self.inner.data.len()].get();
                 let tail_ptr: &mut Option<T> = unsafe { &mut *tail_ptr };
                 tail_ptr.take()
             };
@@ -231,6 +260,10 @@ impl<'a, T: 'a> Drop for RingIter<'a, T> {
 mod tests {
     use super::*;
 
+    use rand::random;
+    use std::thread;
+    use std::time::Duration;
+
     #[test]
     fn tail_conversion() {
         for locked in &[true, false] {
@@ -246,5 +279,41 @@ mod tests {
         for i in -20isize..=20isize {
             assert_eq!(<Tail as Into<isize>>::into(Tail::from(i)), i)
         }
+    }
+
+    #[test]
+    fn test_run() {
+        let (push, pull) = new(5);
+
+        let t1 = thread::spawn(move || {
+            let mut push = push;
+            for i in 1..1000 {
+                push.write(i);
+                println!("Pushed {}", i);
+                thread::sleep(Duration::from_secs(random::<u64>() % 2))
+            }
+        });
+
+        let t2 = thread::spawn(move || {
+            let mut pull = pull;
+
+            for i in 1..1000 {
+                let num = random::<usize>() % 5;
+                println!("Taking {}", num);
+                thread::sleep(Duration::from_secs(5));
+                let res = pull.read()
+                    .take(num)
+                    .map(|x| {
+                        thread::sleep(Duration::from_secs(random::<u64>() % 2));
+                        x
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}, {:?}", num, res);
+                thread::sleep(Duration::from_secs(random::<u64>() % 20))
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 }
